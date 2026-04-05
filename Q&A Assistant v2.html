@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>College Q&A</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap">
+
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.3.1",
+        "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?deps=react@18.3.1",
+        "@google/genai": "https://esm.sh/@google/genai"
+      }
+    }
+    </script>
+    
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        /* Base Styles */
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #ffffff;
+            color: #1a1a1a;
+            margin: 0;
+            padding: 0;
+            overflow-x: hidden;
+        }
+        
+        /* --- Custom Scrollbar Styling --- */
+        ::-webkit-scrollbar { 
+            width: 8px; 
+        }
+        ::-webkit-scrollbar-track { 
+            background: #f1f1f1; 
+        }
+        ::-webkit-scrollbar-thumb { 
+            background: #888; 
+            border-radius: 4px; 
+        }
+        ::-webkit-scrollbar-thumb:hover { 
+            background: #555; 
+        }
+        
+        /* Specific scrollbar for the sidebar navigation */
+        .sidebar-scroll::-webkit-scrollbar { 
+            width: 6px; 
+        }
+        .sidebar-scroll::-webkit-scrollbar-track { 
+            background: #f8f8f8; 
+        }
+        .sidebar-scroll::-webkit-scrollbar-thumb { 
+            background: #d1d5db; 
+            border-radius: 3px; 
+        }
+        .sidebar-scroll::-webkit-scrollbar-thumb:hover { 
+            background: #9ca3af; 
+        }
+
+        /* Print utilities */
+        @media print {
+            .no-print { display: none; }
+            .sidebar-container { display: none; }
+            body { padding: 0; }
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.4s ease-out forwards;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useRef, useEffect } from "react";
+        import ReactDOM from "react-dom/client";
+        import { GoogleGenAI } from "@google/genai";
+    
+        const ai = new GoogleGenAI({ apiKey: "AIzaSyDpVJE7okxw0YDeJIyvEd8qhJF-uwK_3BY" });
+
+        const askCollegeQuestion = async (question, college, mode = 'single', comparisonCollege = null, language = 'English') => {
+            
+            // Base system instruction
+            let systemInstruction = `You are an expert assistant for university research. 
+            Format your answers in clean Markdown, suitable for a professional resume-style document (bullet points are preferred).
+            Respond strictly in ${language}.`;
+
+            let query = "";
+
+            // Construct the prompt based on mode
+            if (mode === 'compare' && comparisonCollege) {
+                systemInstruction += ` Your role is to compare ${college.name} and ${comparisonCollege.name}. 
+                Answer questions based on information found on the official websites of both institutions: ${college.domain} and ${comparisonCollege.domain}.
+                Provide a structured comparison.`;
+
+                query = `${question} site:${college.domain} OR site:${comparisonCollege.domain}`;
+            } else {
+                systemInstruction += ` Your role is to answer questions strictly based on information found on the official ${college.name} website (${college.domain}) and its subdomains.`;
+                query = `${question} site:${college.domain}`;
+            }
+
+            try {
+                const response = await ai.models.generateContent({
+                    model: "gemini-2.5-flash", 
+                    contents: [{ role: 'user', parts: [{ text: query }] }],
+                    config: {
+                        systemInstruction: systemInstruction,
+                        tools: [
+                            { googleSearch: {} }, 
+                            { googleMaps: {} }
+                        ],
+                    },
+                });
+
+                const answer = response.text || "No response generated.";
+                
+                const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];               
+                const sources = groundingChunks
+                    .filter(chunk => chunk.web && chunk.web.uri)
+                    .map(chunk => ({
+                        uri: chunk.web.uri,
+                        title: chunk.web.title || chunk.web.uri,
+                    }));
+
+                const mapLocations = groundingChunks
+                    .filter(chunk => chunk.groundingChunk?.schema?.type === 'google_map_place' || (chunk.web?.uri?.includes('maps.google.com')))
+                    .map(chunk => chunk.web?.uri)
+                    .filter(uri => uri && uri.includes('maps'));
+
+                const uniqueSources = Array.from(new Map(sources.map(item => [item.uri, item])).values());
+
+                return {
+                    answer,
+                    sources: uniqueSources,
+                    mapLocations: [] 
+                };
+
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                throw error;
+            }
+        };
+
+        // Generates "suggested next questions" based on the previous answer
+        const generateFollowUps = async (answer, collegeName) => {
+             try {
+                const prompt = `Based on the following answer about ${collegeName}, suggest 3 short, relevant follow-up questions a student might ask next. Return ONLY a JSON array of strings. 
+                
+                Answer Context: "${answer.substring(0, 1000)}..."`;
+
+                const result = await ai.models.generateContent({
+                    model: "gemini-2.5-flash", 
+                    contents: [{ parts: [{ text: prompt }] }],
+                    config: { responseMimeType: "application/json" }
+                });
+
+                if (result.text) {
+                    return JSON.parse(result.text);
+                }
+                return [];
+             } catch (e) {
+                 return [];
+             }
+        };
+
+        // Expands a specific bullet point into more detail
+        const expandDeepDive = async (point, collegeName) => {
+            try {
+                const prompt = `Expand on the following point regarding ${collegeName} in 2-3 sentences. Be specific and informative.
+                
+                Point: "${point}"`;
+                
+                const result = await ai.models.generateContent({
+                    model: "gemini-2.5-flash",
+                    contents: [{ parts: [{ text: prompt }] }]
+                });
+                return result.text;
+            } catch (e) {
+                return "Could not load details.";
+            }
+        }
+
+        // UI COMPONENTS
+        const DeepDiveItem = ({ text, collegeName }) => {
+            const [expanded, setExpanded] = useState(false);
+            const [loading, setLoading] = useState(false);
+            const [details, setDetails] = useState(null);
+
+            const handleExpand = async () => {
+                if (expanded) {
+                    setExpanded(false);
+                    return;
+                }
+                
+                setExpanded(true);
+                if (!details) {
+                    setLoading(true);
+                    const res = await expandDeepDive(text, collegeName);
+                    setDetails(res);
+                    setLoading(false);
+                }
+            };
+
+            const parseInline = (txt) => {
+                 const parts = txt.split(/(\*\*.*?\*\*|\[.*?\]\(.*?\))/g);
+                return parts.map((part, i) => {
+                    if (part.startsWith('**') && part.endsWith('**')) {
+                        return <strong key={i} className="font-bold text-black">{part.slice(2, -2)}</strong>;
+                    }
+                    if (part.startsWith('[') && part.includes('](') && part.endsWith(')')) {
+                         const match = part.match(/\[(.*?)\]\((.*?)\)/);
+                         if (match) {
+                             return <a key={i} href={match[2]} target="_blank" rel="noopener noreferrer" className="text-blue-700 underline hover:text-blue-900">{match[1]}</a>;
+                         }
+                    }
+                    return part;
+                });
+            };
+
+            return (
+                <li className="relative pl-0 mb-2 text-sm leading-relaxed text-gray-800 flex flex-col items-start">
+                    <div className="flex items-start w-full">
+                        <span className="mr-2 text-black font-bold text-lg leading-[0.8rem] mt-1">•</span>
+                        <div className="flex-1">
+                            {parseInline(text)}
+                            <button 
+                                onClick={handleExpand}
+                                className="ml-2 inline-flex items-center justify-center w-4 h-4 text-gray-400 hover:text-blue-600 transition-colors focus:outline-none align-middle"
+                                title="Deep Dive: Click to expand"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3">
+                                    <path fillRule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clipRule="evenodd" />
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    {expanded && (
+                        <div className="ml-5 mt-2 p-3 bg-blue-50 border-l-2 border-blue-500 text-xs text-gray-700 animate-fade-in rounded-r">
+                            {loading ? (
+                                <div className="flex items-center space-x-2">
+                                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
+                                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></div>
+                                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
+                                </div>
+                            ) : (
+                                <p>{details}</p>
+                            )}
+                        </div>
+                    )}
+                </li>
+            );
+        };
+
+        const SimpleMarkdown = ({ content, collegeName }) => {
+            if (!content) return null;
+
+            const lines = content.split('\n');
+            const elements = [];
+            let currentList = [];
+
+            const parseInlineSimple = (text) => {
+                const parts = text.split(/(\*\*.*?\*\*|\[.*?\]\(.*?\))/g);
+                return parts.map((part, i) => {
+                    if (part.startsWith('**') && part.endsWith('**')) {
+                        return <strong key={i} className="font-bold text-black">{part.slice(2, -2)}</strong>;
+                    }
+                    if (part.startsWith('[') && part.includes('](') && part.endsWith(')')) {
+                         const match = part.match(/\[(.*?)\]\((.*?)\)/);
+                         if (match) {
+                             return <a key={i} href={match[2]} target="_blank" rel="noopener noreferrer" className="text-blue-700 underline hover:text-blue-900">{match[1]}</a>;
+                         }
+                    }
+                    return part;
+                });
+            };
+
+            lines.forEach((line, i) => {
+                const trimLine = line.trim();
+                
+                if (!trimLine) {
+                    if (currentList.length > 0) {
+                        elements.push(<ul key={`list-${i}`} className="list-disc ml-4 mb-2">{currentList}</ul>);
+                        currentList = [];
+                    }
+                    return;
+                }
+
+                if (trimLine.startsWith('* ') || trimLine.startsWith('- ') || trimLine.startsWith('• ')) {
+                    const text = trimLine.replace(/^[*•-]\s+/, '');
+                    currentList.push(
+                        <DeepDiveItem key={`li-${i}`} text={text} collegeName={collegeName} />
+                    );
+                } 
+
+                else if (trimLine.startsWith('#')) {
+                    const level = trimLine.match(/^#+/)[0].length;
+                    const text = trimLine.replace(/^#+\s+/, '');
+                    
+
+                    const className = level === 1 ? "font-bold text-base mt-4 mb-2 uppercase" : 
+                                      level === 2 ? "font-bold text-sm mt-3 mb-1 uppercase" : 
+                                      "font-bold text-sm mt-2 mb-1";
+                    
+                    if (currentList.length > 0) {
+                        elements.push(<ul key={`list-${i}`} className="list-disc ml-4 mb-2">{currentList}</ul>);
+                        currentList = [];
+                    }
+                    elements.push(<div key={`h-${i}`} className={className}>{parseInlineSimple(text)}</div>);
+                } 
+                else {
+                    if (currentList.length > 0) {
+                        elements.push(<ul key={`list-${i}`} className="list-disc ml-4 mb-2">{currentList}</ul>);
+                        currentList = [];
+                    }
+                    elements.push(<p key={`p-${i}`} className="mb-2 text-sm leading-relaxed">{parseInlineSimple(trimLine)}</p>);
+                }
+            });
+
+            if (currentList.length > 0) {
+                elements.push(<ul key={`list-end`} className="list-disc ml-4 mb-2">{currentList}</ul>);
+            }
+
+            return <div>{elements}</div>;
+        };
+
+        const SectionTitle = ({ title }) => (
+            <h2 className="text-sm font-bold tracking-widest text-black uppercase border-b-2 border-gray-200 pb-1 mb-6 mt-10">
+                {title}
+            </h2>
+        );
+
+        const SkillPill = ({ label, onClick }) => (
+            <button 
+                onClick={onClick}
+                disabled={!onClick}
+                className={`inline-block bg-gray-100 border border-gray-200 text-gray-700 text-xs font-semibold px-4 py-2 rounded-full mr-3 mb-3 transition-colors ${onClick ? 'hover:bg-black hover:text-white hover:border-black cursor-pointer' : 'cursor-default'}`}
+            >
+                {label}
+            </button>
+        );
+
+        const ContactTag = ({ icon, text, href }) => {
+            const content = (
+                <div className="flex items-center space-x-2 bg-gray-100 border border-gray-200 px-3 py-1.5 rounded-md text-xs font-medium text-gray-700 hover:border-gray-400 transition-colors">
+                    <span className="text-gray-500">{icon}</span>
+                    <span>{text}</span>
+                </div>
+            );
+
+            if (href) {
+                return (
+                    <a href={href} target="_blank" rel="noopener noreferrer" className="inline-block hover:opacity-80 transition-opacity">
+                        {content}
+                    </a>
+                );
+            }
+            return <div className="inline-block">{content}</div>;
+        };
+
+        const INITIAL_COLLEGES = [
+            {
+                id: 'mit',
+                name: 'Massachusetts Institute of Technology',
+                shortName: 'MIT',
+                domain: 'mit.edu',
+                location: 'Cambridge, MA',
+                suggestions: [
+                    "What is the history of the Brass Rat?",
+                    "How do I apply for undergraduate admission?",
+                    "Tell me about the MIT Media Lab.",
+                    "Who are some famous MIT alumni?",
+                    "What is the Infinite Corridor?"
+                ]
+            },
+            {
+                id: 'harvard',
+                name: 'Harvard University',
+                shortName: 'Harvard',
+                domain: 'harvard.edu',
+                location: 'Cambridge, MA',
+                suggestions: [
+                    "What is the acceptance rate?",
+                    "Tell me about the house system.",
+                    "What are the popular majors?",
+                    "History of Harvard Yard",
+                    "How to apply to Harvard Law School?"
+                ]
+            },
+            {
+                id: 'stanford',
+                name: 'Stanford University',
+                shortName: 'Stanford',
+                domain: 'stanford.edu',
+                location: 'Stanford, CA',
+                suggestions: [
+                    "What is the 'Stanford Duck Syndrome'?",
+                    "Tell me about the d.school.",
+                    "Admission requirements for engineering",
+                    "Who founded Stanford?",
+                    "What is the Hoover Institution?"
+                ]
+            },
+            {
+                id: 'yale',
+                name: 'Yale University',
+                shortName: 'Yale',
+                domain: 'yale.edu',
+                location: 'New Haven, CT',
+                suggestions: [
+                    "Explain the residential college system.",
+                    "What is the Yale Daily News?",
+                    "Tell me about the drama school.",
+                    "Who is Handsome Dan?",
+                    "Tuition and financial aid"
+                ]
+            },
+            {
+                id: 'princeton',
+                name: 'Princeton University',
+                shortName: 'Princeton',
+                domain: 'princeton.edu',
+                location: 'Princeton, NJ',
+                suggestions: [
+                    "What are eating clubs?",
+                    "Tell me about the senior thesis requirement.",
+                    "What is the preceptorial system?",
+                    "History of Nassau Hall",
+                    "Undergraduate financial aid policies"
+                ]
+            }
+        ];
+
+        const LANGUAGES = ['English', 'Spanish', 'French', 'Chinese', 'Japanese', 'Arabic', 'German'];
+
+        // Dropdown component for selecting institutions
+        const CollegeDropdown = ({ colleges, selectedCollege, onSelect, label = "Institution" }) => {
+            const [isOpen, setIsOpen] = useState(false);
+            const dropdownRef = useRef(null);
+
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+                        setIsOpen(false);
+                    }
+                };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, []);
+
+            return (
+                <div className="relative w-full md:w-80 z-30" ref={dropdownRef}>
+                    <button
+                        onClick={() => setIsOpen(!isOpen)}
+                        className={`w-full flex items-center justify-between px-4 py-3 bg-white border rounded-md transition-all duration-200 group ${
+                            isOpen 
+                                ? 'border-black ring-1 ring-black shadow-lg' 
+                                : 'border-gray-200 hover:border-gray-400 hover:shadow-sm'
+                        }`}
+                    >
+                        <div className="flex flex-col items-start overflow-hidden mr-2">
+                            <span className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-0.5">{label}</span>
+                            <span className="font-bold text-black text-sm truncate w-full text-left leading-tight">{selectedCollege ? selectedCollege.name : "Select College"}</span>
+                        </div>
+                        <div className={`p-1.5 rounded-full bg-gray-50 transition-colors group-hover:bg-gray-100 flex-shrink-0 ${isOpen ? 'bg-gray-100' : ''}`}>
+                             <svg 
+                                xmlns="http://www.w3.org/2000/svg" 
+                                viewBox="0 0 24 24" 
+                                fill="none" 
+                                stroke="currentColor" 
+                                strokeWidth="2.5" 
+                                strokeLinecap="round" 
+                                strokeLinejoin="round" 
+                                className={`w-3.5 h-3.5 text-gray-500 transition-transform duration-300 ${isOpen ? 'rotate-180 text-black' : ''}`}
+                            >
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </div>
+                    </button>
+
+                    {/* Dropdown Options */}
+                    <div 
+                        className={`absolute top-full left-0 right-0 mt-2 bg-white rounded-lg shadow-2xl border border-gray-100 overflow-hidden transform transition-all duration-200 origin-top ${
+                            isOpen ? 'opacity-100 scale-100 translate-y-0' : 'opacity-0 scale-95 -translate-y-2 pointer-events-none'
+                        }`}
+                    >
+                        <div className="max-h-[320px] overflow-y-auto sidebar-scroll py-2">
+                            {colleges.map((college) => {
+                                const isSelected = selectedCollege && selectedCollege.id === college.id;
+                                return (
+                                    <button
+                                        key={college.id}
+                                        onClick={() => {
+                                            onSelect(college);
+                                            setIsOpen(false);
+                                        }}
+                                        className={`w-full text-left px-5 py-3.5 transition-all duration-150 flex items-center justify-between group border-l-4 ${
+                                            isSelected 
+                                                ? 'bg-gray-50 border-black' 
+                                                : 'border-transparent hover:bg-gray-50 hover:border-gray-200'
+                                        }`}
+                                    >
+                                        <div className="flex flex-col overflow-hidden pr-3">
+                                            <span className={`text-sm font-bold truncate leading-tight mb-1 ${isSelected ? 'text-black' : 'text-gray-600 group-hover:text-black'}`}>
+                                                {college.name}
+                                            </span>
+                                            <span className={`text-[10px] font-medium uppercase tracking-wide ${isSelected ? 'text-black' : 'text-gray-400'}`}>
+                                                {college.shortName}
+                                            </span>
+                                        </div>
+                                        {isSelected && (
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-black flex-shrink-0 ml-2">
+                                                <path fillRule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm13.36-1.814a.75.75 0 10-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 00-1.06 1.06l2.25 2.25a.75.75 0 001.14-.094l3.75-5.25z" clipRule="evenodd" />
+                                            </svg>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [colleges, setColleges] = useState(() => {
+                const saved = localStorage.getItem('college_qa_colleges');
+                return saved ? JSON.parse(saved) : INITIAL_COLLEGES;
+            });
+            const [history, setHistory] = useState(() => {
+                const saved = localStorage.getItem('college_qa_history');
+                return saved ? JSON.parse(saved) : [];
+            });
+
+            useEffect(() => {
+                localStorage.setItem('college_qa_colleges', JSON.stringify(colleges));
+            }, [colleges]);
+
+            useEffect(() => {
+                localStorage.setItem('college_qa_history', JSON.stringify(history));
+            }, [history]);
+
+            const [selectedCollege, setSelectedCollege] = useState(colleges[0]);
+            const [mode, setMode] = useState('single'); // 'single' | 'compare'
+            const [comparisonCollege, setComparisonCollege] = useState(null);
+            const [language, setLanguage] = useState('English');
+            const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+            const [isModalOpen, setIsModalOpen] = useState(false);
+
+            const [query, setQuery] = useState('');
+            const [isLoading, setIsLoading] = useState(false);
+            const [response, setResponse] = useState(null);
+            const [sources, setSources] = useState([]);
+            const [followUps, setFollowUps] = useState([]);
+
+            const [querySuggestions, setQuerySuggestions] = useState([]);
+            const [showSuggestions, setShowSuggestions] = useState(false);
+            
+            const [newCollegeData, setNewCollegeData] = useState({
+                name: '',
+                shortName: '',
+                domain: '',
+                location: ''
+            });
+            const [isAutofilling, setIsAutofilling] = useState(false);
+
+            const textareaRef = useRef(null);
+
+            useEffect(() => {
+                if (textareaRef.current) {
+                    textareaRef.current.style.height = 'auto';
+                    textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+                }
+            }, [query]);
+
+            useEffect(() => {
+                const timer = setTimeout(async () => {
+                    if (!query || query.trim().length < 3) {
+                        setShowSuggestions(false);
+                        return;
+                    }
+
+                    if (querySuggestions.includes(query)) {
+                         return;
+                    }
+
+                    try {
+                        const prompt = `The user is typing a query about ${selectedCollege.name} ("${selectedCollege.shortName}").
+                        Current text input: "${query}"
+                        
+                        Task:
+                        1. Correct any spelling or grammar errors in the input.
+                        2. Predict and autocomplete the question the user is likely asking.
+                        3. Provide 3 distinct, complete, and grammatically correct question options relevant to ${selectedCollege.shortName}.
+                        
+                        Return strictly a JSON array of strings. Example: ["How do I apply for financial aid?", "What are the tuition fees?"]`;
+
+                        const result = await ai.models.generateContent({
+                            model: "gemini-2.5-flash", 
+                            contents: [{ parts: [{ text: prompt }] }],
+                            config: { responseMimeType: "application/json" }
+                        });
+
+                        if (result.text) {
+                            const data = JSON.parse(result.text);
+                            if (Array.isArray(data) && data.length > 0) {
+                                const validSuggestions = data.filter(s => s.toLowerCase() !== query.toLowerCase());
+                                if (validSuggestions.length > 0) {
+                                    setQuerySuggestions(validSuggestions);
+                                    setShowSuggestions(true);
+                                } else {
+                                    setShowSuggestions(false);
+                                }
+                            }
+                        }
+                    } catch (error) {
+                    }
+                }, 500);
+
+                return () => clearTimeout(timer);
+            }, [query, selectedCollege]);
+
+
+            // Effect: Autofill New College Data
+            useEffect(() => {
+                const timer = setTimeout(async () => {
+                    const nameInput = newCollegeData.name;
+                    if (isModalOpen && nameInput.length > 2) {
+                         setIsAutofilling(true);
+                         try {
+                             const prompt = `Identify the university from the partial input "${nameInput}". 
+                             Return a JSON object with:
+                             {
+                                "officialName": "Full Official Name",
+                                "shortName": "Common Abbreviation",
+                                "domain": "website.edu (root domain only, no www/https)",
+                                "location": "City, State"
+                             }
+                             If it is not a clear university match, return empty strings.`;
+
+                             const result = await ai.models.generateContent({
+                                model: "gemini-2.5-flash", 
+                                contents: [{ parts: [{ text: prompt }] }],
+                                config: { responseMimeType: "application/json" }
+                            });
+
+                            if (result.text) {
+                                const data = JSON.parse(result.text);
+                                if (data && data.domain) {
+                                    setNewCollegeData(prev => ({
+                                        ...prev,
+                                        shortName: data.shortName || prev.shortName,
+                                        domain: data.domain || prev.domain,
+                                        location: data.location || prev.location
+                                    }));
+                                }
+                            }
+                         } catch (err) {
+                             console.log("Autofill skipped", err);
+                         } finally {
+                             setIsAutofilling(false);
+                         }
+                    }
+                }, 500);
+
+                return () => clearTimeout(timer);
+            }, [newCollegeData.name, isModalOpen]);
+
+            const handleCollegeSelect = (college) => {
+                setSelectedCollege(college);
+                setResponse(null);
+                setSources([]);
+                setQuery('');
+                setQuerySuggestions([]);
+                setShowSuggestions(false);
+                setFollowUps([]);
+            };
+
+            const handleSearch = async (e) => {
+                if (e) e.preventDefault();
+                if (!query.trim() || isLoading) return;
+                
+                setShowSuggestions(false);
+                setIsLoading(true);
+                setResponse(null);
+                setSources([]);
+                setFollowUps([]);
+
+                try {
+                    const result = await askCollegeQuestion(query, selectedCollege, mode, comparisonCollege, language);
+                    setResponse(result.answer);
+                    setSources(result.sources);
+
+                    const generatedFollowUps = await generateFollowUps(result.answer, selectedCollege.name);
+                    setFollowUps(generatedFollowUps);
+
+                    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    setHistory(prev => [{
+                        id: Date.now(),
+                        college: selectedCollege,
+                        query: query,
+                        response: result.answer,
+                        sources: result.sources,
+                        timestamp: timestamp,
+                        date: new Date().toLocaleDateString(),
+                        mode: mode
+                    }, ...prev]);
+
+                } catch (error) {
+                    console.error(error);
+                    setResponse(`An error occurred while fetching information. Please ensure your query is related to ${selectedCollege.shortName} and try again.`);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const restoreHistory = (item) => {
+                const college = colleges.find(c => c.id === item.college.id) || item.college;
+                setSelectedCollege(college);
+                setQuery(item.query);
+                setResponse(item.response);
+                setSources(item.sources);
+                setQuerySuggestions([]);
+                setShowSuggestions(false);
+                setFollowUps([]); // History doesn't store followups yet
+                
+                // Close sidebar on mobile
+                if (window.innerWidth < 1024) {
+                    setIsSidebarOpen(false);
+                }
+                
+                // Fix textarea height after restore
+                setTimeout(() => {
+                    if (textareaRef.current) {
+                        textareaRef.current.style.height = 'auto';
+                        textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+                    }
+                }, 100);
+            };
+
+            const handleClearHistory = () => {
+                if (history.length > 0 && window.confirm("Are you sure you want to clear your research history?")) {
+                    setHistory([]);
+                }
+            };
+
+            const handleSuggestionClick = (suggestion) => {
+                setQuery(suggestion);
+                setTimeout(() => {
+                    if (textareaRef.current) {
+                        textareaRef.current.focus();
+                        textareaRef.current.style.height = 'auto';
+                        textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+                    }
+                }, 0);
+            };
+
+            const handleAddCollege = (e) => {
+                e.preventDefault();
+                const { name, shortName, domain, location } = newCollegeData;
+                
+                if (!name || !domain) return;
+
+                const id = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+                
+                const newCollege = {
+                    id,
+                    name,
+                    shortName: shortName || name,
+                    domain: domain.replace(/^https?:\/\//, '').replace(/\/$/, ''),
+                    location: location || 'Unknown Location',
+                    suggestions: [
+                        "Admissions requirements",
+                        "Tuition and Financial Aid",
+                        "Academic Programs",
+                        "Campus Life",
+                        "History and Traditions"
+                    ]
+                };
+
+                setColleges(prev => [...prev, newCollege]);
+                setSelectedCollege(newCollege);
+                setIsModalOpen(false);
+
+                setNewCollegeData({ name: '', shortName: '', domain: '', location: '' });
+                setResponse(null);
+                setSources([]);
+                setQuery('');
+            };
+
+            return (
+                <div className="min-h-screen relative overflow-hidden bg-white">
+                    
+                    <button 
+                        onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                        className={`fixed left-4 top-4 z-50 p-2 shadow-lg transition-colors no-print rounded-none ${isSidebarOpen ? 'bg-black text-white hover:bg-gray-800' : 'bg-black text-white hover:bg-gray-800'}`}
+                        title={isSidebarOpen ? "Close History" : "Open History"}
+                    >
+                        {isSidebarOpen ? (
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5">
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        ) : (
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5">
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" />
+                            </svg>
+                        )}
+                    </button>
+
+                    {/* --- History Sidebar --- */}
+                    <div className={`sidebar-container fixed inset-y-0 left-0 w-80 bg-white shadow-2xl transform transition-transform duration-300 ease-in-out z-40 border-r border-gray-300 ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+                        <div className="flex flex-col h-full pt-16 pb-6 px-5">
+                            <div className="flex items-center justify-between mb-6 border-b-2 border-gray-200 pb-2">
+                                <h2 className="text-black text-sm font-bold uppercase tracking-widest">
+                                    Research History
+                                </h2>
+                                {history.length > 0 && (
+                                    <button 
+                                        onClick={handleClearHistory}
+                                        className="text-[10px] font-bold text-gray-400 hover:text-red-600 uppercase tracking-widest transition-colors cursor-pointer"
+                                        title="Clear All History"
+                                    >
+                                        Clear
+                                    </button>
+                                )}
+                            </div>
+                            
+                            <div className="flex-1 overflow-y-auto sidebar-scroll pr-2 space-y-4">
+                                {history.length === 0 ? (
+                                    <div className="text-gray-400 text-xs text-center italic mt-10">
+                                        No queries recorded in this session.
+                                    </div>
+                                ) : (
+                                    history.map((item) => (
+                                        <div 
+                                            key={item.id} 
+                                            onClick={() => restoreHistory(item)}
+                                            className="group bg-gray-50 hover:bg-white p-4 cursor-pointer border border-gray-100 hover:border-black transition-all rounded-sm relative"
+                                        >
+                                            <div className="flex justify-between items-center mb-2">
+                                                <span className="text-[11px] font-extrabold text-black uppercase tracking-wider truncate max-w-[140px]">
+                                                    {item.college.shortName}
+                                                </span>
+                                                <span className="text-[10px] text-gray-400 font-medium">{item.timestamp}</span>
+                                            </div>
+                                            <p className="text-xs text-gray-600 line-clamp-2 leading-relaxed group-hover:text-black font-medium">
+                                                {item.query}
+                                            </p>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-gray-200 text-[10px] text-gray-400 text-center font-medium uppercase tracking-wide">
+                                Session Log
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* --- Content Area --- */}
+                    <div 
+                        className={`min-h-screen transition-all duration-300 ${isSidebarOpen ? 'lg:pl-80' : ''}`}
+                        onClick={() => {
+                            if(window.innerWidth < 1024 && isSidebarOpen) setIsSidebarOpen(false);
+                        }}
+                    >
+                        <div className="w-full max-w-5xl mx-auto px-6 py-12 sm:px-10 pb-24">
+                            
+                            <header className="mb-10 border-b-0 flex flex-col items-start gap-6">
+                                <div className="w-full flex flex-col md:flex-row justify-between items-start gap-6">
+                                    <div className="flex-1">
+                                        <h1 className="text-4xl sm:text-5xl font-extrabold text-black uppercase mb-5 tracking-tight">
+                                            {selectedCollege.shortName} Q&A Assistant
+                                        </h1>
+                                        
+                                        <div className="flex flex-wrap gap-3 mb-4">
+                                            <ContactTag 
+                                                icon={
+                                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3 h-3">
+                                                        <path d="M1.5 8.67v8.58a3 3 0 003 3h15a3 3 0 003-3V8.67l-8.928 5.493a3 3 0 01-3.144 0L1.5 8.67z" />
+                                                        <path d="M22.5 6.908V6.75a3 3 0 00-3-3h-15a3 3 0 00-3 3v.158l9.714 5.978a1.5 1.5 0 001.572 0L22.5 6.908z" />
+                                                    </svg>
+                                                }
+                                                text={selectedCollege.domain}
+                                                href={`https://${selectedCollege.domain}`}
+                                            />
+                                            <ContactTag 
+                                                icon={
+                                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3 h-3">
+                                                        <path fillRule="evenodd" d="M11.54 22.351l.07.04.028.016a.76.76 0 00.723 0l.028-.015.071-.041a16.975 16.975 0 001.144-.742 19.58 19.58 0 002.683-2.282c1.944-1.99 3.963-4.98 3.963-8.827a8.25 8.25 0 00-16.5 0c0 3.846 2.02 6.837 3.963 8.827a19.58 19.58 0 002.682 2.282 16.975 16.975 0 001.145.742zM12 13.5a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
+                                                    </svg>
+                                                }
+                                                text={selectedCollege.location} 
+                                            />
+                                            <ContactTag 
+                                                icon={
+                                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3 h-3">
+                                                        <path fillRule="evenodd" d="M8.161 2.58a2.13 2.13 0 012.678 0L13.832 5h7.042a1 1 0 011 1v14a1 1 0 01-1 1H13.5l-3.328-2.42a2.13 2.13 0 00-2.678 0L4.167 21H2a1 1 0 01-1-1V6a1 1 0 011-1h6.66l-.499-.42zM4.166 19l2.834-2.126a3.63 3.63 0 014.566 0L14.834 19h5.042V6.42l-6.155-2.052a3.63 3.63 0 00-2.414 0L5.166 6.42V19H4.167z" clipRule="evenodd" />
+                                                    </svg>
+                                                }
+                                                text="View Map"
+                                                href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(selectedCollege.name + ' ' + selectedCollege.location)}`}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div className="flex flex-col gap-3 w-full md:w-auto items-end">
+                                        <div className="flex gap-2">
+                                            <div className="flex bg-gray-100 rounded p-1">
+                                                <button 
+                                                    onClick={() => {
+                                                        setMode('single');
+                                                        setComparisonCollege(null);
+                                                    }}
+                                                    className={`px-3 py-1.5 text-xs font-bold rounded transition-colors ${mode === 'single' ? 'bg-white text-black shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                                                >
+                                                    Single
+                                                </button>
+                                                <button 
+                                                    onClick={() => setMode('compare')}
+                                                    className={`px-3 py-1.5 text-xs font-bold rounded transition-colors ${mode === 'compare' ? 'bg-white text-black shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                                                >
+                                                    Compare
+                                                </button>
+                                            </div>
+
+                                            {/* Language Dropdown */}
+                                            <div className="relative group z-50">
+                                                <button className="flex items-center gap-1 bg-white border border-gray-200 hover:border-black text-xs font-bold px-3 py-2 rounded h-[38px] transition-colors">
+                                                    <span>{language}</span>
+                                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3">
+                                                        <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                                                    </svg>
+                                                </button>
+                                                <div className="absolute right-0 top-full mt-1 bg-white border border-gray-100 shadow-xl rounded hidden group-hover:block w-32 max-h-60 overflow-y-auto">
+                                                    {LANGUAGES.map(lang => (
+                                                        <button 
+                                                            key={lang} 
+                                                            onClick={() => setLanguage(lang)}
+                                                            className="w-full text-left px-3 py-2 text-xs hover:bg-gray-50 text-gray-700 hover:text-black"
+                                                        >
+                                                            {lang}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-2 w-full md:w-auto">
+                                            <CollegeDropdown 
+                                                colleges={colleges} 
+                                                selectedCollege={selectedCollege} 
+                                                onSelect={handleCollegeSelect} 
+                                            />
+                                            <button 
+                                                onClick={() => setIsModalOpen(true)}
+                                                className="bg-black text-white p-3 rounded-md hover:bg-gray-800 transition-colors shadow-sm border border-black h-[50px] w-[50px] flex items-center justify-center"
+                                                title="Add Custom College"
+                                            >
+                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5">
+                                                    <path fillRule="evenodd" d="M12 3.75a.75.75 0 01.75.75v6.75h6.75a.75.75 0 010 1.5h-6.75v6.75a.75.75 0 01-1.5 0v-6.75H4.5a.75.75 0 010-1.5h6.75V4.5a.75.75 0 01.75-.75z" clipRule="evenodd" />
+                                                </svg>
+                                            </button>
+                                        </div>
+
+                                        {/* Comparison Selection */}
+                                        {mode === 'compare' && (
+                                             <div className="w-full md:w-auto animate-fade-in relative z-20">
+                                                <CollegeDropdown 
+                                                    colleges={colleges.filter(c => c.id !== selectedCollege.id)} 
+                                                    selectedCollege={comparisonCollege || {name: "Select 2nd College", shortName: "Compare With..."}} 
+                                                    onSelect={setComparisonCollege} 
+                                                    label="Compare With"
+                                                />
+                                             </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </header>
+
+                            {/* Query Input Section */}
+                            <section>
+                                <SectionTitle title={mode === 'compare' ? "COMPARISON QUERY" : "QUERY OBJECTIVE"} />
+                                
+                                <div className="mb-6 text-base text-gray-600 leading-relaxed max-w-3xl">
+                                    {mode === 'compare' ? 
+                                        `Submit a query to compare ${selectedCollege.shortName} and ${comparisonCollege ? comparisonCollege.shortName : 'another institution'}. The system will analyze both data sources.` 
+                                        : 
+                                        `Submit a query regarding ${selectedCollege.name} admissions, history, campus life, or academic programs. The system will retrieve real-time data from official sources.`
+                                    }
+                                </div>
+                                
+                                <form onSubmit={handleSearch} className="relative">
+                                    <div className="flex flex-col gap-4 relative">
+                                        <div className="relative w-full">
+                                            <textarea
+                                                ref={textareaRef}
+                                                value={query}
+                                                onChange={(e) => setQuery(e.target.value)}
+                                                onFocus={() => {
+                                                    if (querySuggestions.length > 0) setShowSuggestions(true);
+                                                }}
+                                                onBlur={() => {
+                                                    setTimeout(() => setShowSuggestions(false), 200);
+                                                }}
+                                                placeholder={mode === 'compare' ? "e.g. Compare the computer science curriculum and tuition costs." : "Enter your question here..."}
+                                                className="w-full bg-white border border-gray-300 p-4 text-base rounded-md focus:outline-none focus:border-black focus:ring-1 focus:ring-black transition-all resize-none overflow-hidden min-h-[100px] shadow-sm z-10 relative"
+                                                onKeyDown={(e) => {                                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                                        e.preventDefault();
+                                                        handleSearch();
+                                                    }
+                                                }}
+                                            />
+                                            
+                                            {/* Auto-Complete Dropdown */}
+                                            {showSuggestions && querySuggestions.length > 0 && (
+                                                <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-gray-200 shadow-xl rounded-md overflow-hidden z-20 animate-fade-in">
+                                                    <div className="bg-gray-50 px-4 py-2 text-[10px] font-bold text-gray-400 uppercase tracking-widest border-b border-gray-100 flex justify-between items-center">
+                                                        <span>Auto-Complete & Corrections</span>
+                                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3 text-blue-500">
+                                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" />
+                                                        </svg>
+                                                    </div>
+                                                    {querySuggestions.map((suggestion, idx) => (
+                                                        <button
+                                                            key={idx}
+                                                            type="button"
+                                                            onMouseDown={(e) => {
+                                                                e.preventDefault(); 
+                                                                setQuery(suggestion);
+                                                                setShowSuggestions(false);
+                                                                setTimeout(() => {
+                                                                     if (textareaRef.current) {
+                                                                         textareaRef.current.focus();
+                                                                         textareaRef.current.style.height = 'auto';
+                                                                         textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+                                                                     }
+                                                                }, 0);
+                                                            }}
+                                                            className="w-full text-left px-4 py-3 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-900 border-b border-gray-50 last:border-0 transition-colors flex items-center gap-2 group"
+                                                        >
+                                                            <span className="opacity-0 group-hover:opacity-100 text-blue-500 font-bold text-xs transition-opacity">•</span>
+                                                            <span className="truncate">{suggestion}</span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="flex justify-end">
+                                            <button 
+                                                type="submit"
+                                                disabled={isLoading || !query.trim() || (mode === 'compare' && !comparisonCollege)}
+                                                className="bg-black text-white px-8 py-3 text-sm font-bold uppercase tracking-wider rounded hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-md"
+                                            >
+                                                {isLoading ? 'Processing...' : 'Execute'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </form>
+                            </section>
+
+                            <section>
+                                <SectionTitle title="SUGGESTED TOPICS" />
+                                <div className="flex flex-wrap">
+                                    {selectedCollege.suggestions.map((topic, idx) => (
+                                        <SkillPill key={idx} label={topic} onClick={() => handleSuggestionClick(topic)} />
+                                    ))}
+                                </div>
+                            </section>
+
+                            {(response || isLoading) && (
+                                <section className="animate-fade-in mt-8">
+                                    <SectionTitle title="RESPONSE GENERATION" />
+                                    
+                                    <div className="mb-6 bg-gray-50 border border-gray-100 p-6 rounded-lg">
+                                        <div className="flex justify-between items-baseline mb-4 pb-2 border-b border-gray-200">
+                                            <h3 className="font-bold text-lg uppercase text-black">
+                                                {isLoading ? "Analyzing Request..." : "Generated Answer"}
+                                            </h3>
+                                            <span className="text-xs font-semibold text-gray-500 italic">
+                                                {isLoading ? "Pending" : new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                                            </span>
+                                        </div>
+                                        
+                                        {isLoading ? (
+                                            <div className="space-y-4">
+                                                <div className="h-4 bg-gray-200 rounded w-3/4 animate-pulse"></div>
+                                                <div className="h-4 bg-gray-200 rounded w-full animate-pulse"></div>
+                                                <div className="h-4 bg-gray-200 rounded w-5/6 animate-pulse"></div>
+                                                <div className="h-4 bg-gray-200 rounded w-4/6 animate-pulse"></div>
+                                            </div>
+                                        ) : (
+                                            <div className="text-base text-gray-800 leading-relaxed space-y-3">
+                                                <SimpleMarkdown content={response || ''} collegeName={selectedCollege.name} />
+                                            </div>
+                                        )}
+
+                                        {!isLoading && followUps.length > 0 && (
+                                            <div className="mt-8 pt-4 border-t border-gray-200 animate-fade-in">
+                                                 <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">
+                                                    Suggested Follow-up Questions
+                                                 </h4>
+                                                 <div className="flex flex-wrap gap-2">
+                                                    {followUps.map((q, idx) => (
+                                                        <button 
+                                                            key={idx}
+                                                            onClick={() => handleSuggestionClick(q)}
+                                                            className="text-xs bg-white border border-blue-200 text-blue-700 hover:bg-blue-50 hover:border-blue-300 px-3 py-1.5 rounded-full transition-colors font-medium"
+                                                        >
+                                                            {q}
+                                                        </button>
+                                                    ))}
+                                                 </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </section>
+                            )}
+
+                            {!isLoading && sources.length > 0 && (
+                                <section className="mt-8">
+                                    <SectionTitle title="CITATIONS & SOURCES" />
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        {sources.map((source, index) => (
+                                            <div key={index} className="relative group flex flex-col border border-gray-100 p-4 rounded hover:border-black transition-all bg-white hover:shadow-sm">                                               
+                                                <div className="absolute bottom-full left-0 mb-2 w-full hidden group-hover:block z-20">
+                                                    <div className="bg-black text-white text-[10px] p-2 rounded shadow-lg break-all">
+                                                        {source.uri}
+                                                    </div>
+                                                    <div className="w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[6px] border-t-black absolute -bottom-1 left-4"></div>
+                                                </div>
+
+                                                <h4 className="font-bold text-sm text-black uppercase mb-1 truncate relative z-10">
+                                                    <a href={source.uri} target="_blank" rel="noopener noreferrer" className="hover:underline focus:outline-none">
+                                                        {source.title}
+                                                    </a>
+                                                </h4>
+                                                
+                                                <div className="mt-3 flex justify-between items-end">
+                                                    <a href={source.uri} target="_blank" rel="noopener noreferrer" className="text-[10px] font-medium text-gray-400 hover:text-black truncate max-w-[60%] transition-colors">
+                                                        {(() => {
+                                                            try {
+                                                                return new URL(source.uri).hostname.replace('www.', '');
+                                                            } catch (e) {
+                                                                return 'Source Link';
+                                                            }
+                                                        })()}
+                                                    </a>
+                                                    <div className="text-[10px] font-bold text-gray-300 group-hover:text-gray-400 uppercase tracking-widest transition-colors">
+                                                        Verified Source
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </section>
+                            )}
+                        </div>
+                    </div>
+
+                    {isModalOpen && (
+                        <div className="fixed inset-0 bg-black bg-opacity-60 backdrop-blur-sm flex items-center justify-center z-50 px-4">
+                            <div className="bg-white p-8 w-full max-w-lg shadow-2xl rounded-lg">
+                                <h2 className="text-2xl font-bold uppercase mb-6 border-b border-gray-200 pb-3">Add New Institution</h2>
+                                <form onSubmit={handleAddCollege} className="flex flex-col gap-5">
+                                    <div className="relative">
+                                        <label className="block text-xs font-bold uppercase text-gray-600 mb-2">Full Name</label>
+                                        <div className="relative">
+                                            <input 
+                                                type="text" 
+                                                required
+                                                placeholder="e.g. University of California, Berkeley"
+                                                className="w-full bg-gray-50 border border-gray-300 p-3 text-sm rounded focus:outline-none focus:border-black focus:ring-1 focus:ring-black pr-10"
+                                                value={newCollegeData.name}
+                                                onChange={(e) => setNewCollegeData({...newCollegeData, name: e.target.value})}
+                                            />
+                                            {isAutofilling && (
+                                                <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+                                                    <svg className="animate-spin h-4 w-4 text-black" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                    </svg>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {isAutofilling && <p className="text-[10px] text-gray-400 mt-1 absolute right-0">Autofilling details...</p>}
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-xs font-bold uppercase text-gray-600 mb-2">Short Name</label>
+                                        <input 
+                                            type="text" 
+                                            placeholder="e.g. UC Berkeley"
+                                            className="w-full bg-gray-50 border border-gray-300 p-3 text-sm rounded focus:outline-none focus:border-black focus:ring-1 focus:ring-black"
+                                            value={newCollegeData.shortName}
+                                            onChange={(e) => setNewCollegeData({...newCollegeData, shortName: e.target.value})}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-bold uppercase text-gray-600 mb-2">Website Domain</label>
+                                        <input 
+                                            type="text" 
+                                            required
+                                            placeholder="e.g. berkeley.edu"
+                                            className="w-full bg-gray-50 border border-gray-300 p-3 text-sm rounded focus:outline-none focus:border-black focus:ring-1 focus:ring-black"
+                                            value={newCollegeData.domain}
+                                            onChange={(e) => setNewCollegeData({...newCollegeData, domain: e.target.value})}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-bold uppercase text-gray-600 mb-2">Location</label>
+                                        <input 
+                                            type="text" 
+                                            placeholder="e.g. Berkeley, CA"
+                                            className="w-full bg-gray-50 border border-gray-300 p-3 text-sm rounded focus:outline-none focus:border-black focus:ring-1 focus:ring-black"
+                                            value={newCollegeData.location}
+                                            onChange={(e) => setNewCollegeData({...newCollegeData, location: e.target.value})}
+                                        />
+                                    </div>
+                                    
+                                    <div className="flex justify-end gap-3 mt-6">
+                                        <button 
+                                            type="button" 
+                                            onClick={() => setIsModalOpen(false)}
+                                            className="px-6 py-2.5 text-xs font-bold uppercase text-gray-600 hover:text-black hover:bg-gray-100 rounded transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button 
+                                            type="submit" 
+                                            className="px-6 py-2.5 bg-black text-white text-xs font-bold uppercase hover:bg-gray-800 rounded transition-colors shadow-lg"
+                                        >
+                                            Add Institution
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="fixed bottom-0 w-full bg-white/95 backdrop-blur-sm text-center py-3 text-[10px] text-gray-400 border-t border-gray-200 no-print z-20">
+                        © 2026 {selectedCollege.name} Q&A. Created by Sahan Malinga.
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
